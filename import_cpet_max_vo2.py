@@ -1,155 +1,160 @@
 import os
 import glob
 import pandas as pd
-import openpyxl
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-INPUT_FOLDER = "./CPET results (new)"          # Directory containing individual CPET spreadsheets
-OUTPUT_FILE = "VAPAHCS CPET DB.xlsx"    # Target master spreadsheet
-OUTPUT_SHEET = "baseline (new)"        # Target sheet name inside master file
-
-# Master Column Mapping: {Master_Column_Name: [Possible_Source_Column_Names]}
-COLUMN_MAPPING = {
-    # Identifying Information
-    "Name": ["Name", "Subject Name"],
-    "Study ID #": ["ID1", "Study ID #", "Study ID"],
-    "Gender": ["Gender", "Sex"],
-    "Age at ETT": ["Age"],
-    "Height\n (in.)": ["Height (in)", "Height (in.)", "Height (in) "],
-    "Weight \n(lbs.)": ["Weight (lbs)", "Weight (lbs.)", "Weight (lbs) "],
-    "Date of ETT": ["Test date", "Date"],
-
-    # Peak CPET Metrics (Captured at Peak VO2)
-    "VO2 ml/Kg/min (max)": ["VO2/kg", "VO2/Kg"],
-    "VO2 in ml (max)": ["VO2"],
-    "VCO2 (max)": ["VCO2"],
-    "VE (max)": ["VE"],
-    "RER max": ["RQ", "RER", "RER max"],  # Treats RQ and RER as equivalent
-    "Measured METs (Max VO2)": ["METS", "METs"],
-
-    # Custom Mappings
-    "VE/VC02 Slope": ["VE/VCO2", "VE/VCO2 Slope", "VE/VC02 Slope"],
-    "Angina (Ex or R) reason for stopping?": ["Reason for Stopping Test", "Reason for Test", "Angina reason for stopping"]
-}
+# File Paths & Configuration
+MASTER_DB_PATH = "VAPAHCS CPET DB.xlsx"
+MASTER_SHEET_NAME = "baseline (new)"
+BXB_FILES_DIRECTORY = "./CPET results (new)"  # Folder containing breath-by-breath Excel files
 
 
 def extract_header_metadata(df_raw):
-    """
-    Scans the header rows and extracts key-value pairs, automatically looking
-    to the right past empty/merged cells to find the matching value for each key (e.g., ID1).
-    """
+    """Scans the header section (rows 0-14) to extract patient demographics and test details."""
+    key_mapping = {
+        "ID1": "Study ID #",
+        "Last Name": "Last Name",
+        "First Name": "First Name",
+        "Gender": "Gender",
+        "Age": "Age at ETT",
+        "Height (in)": "Height\n (in.)",
+        "Weight (lbs)": "Weight \n(lbs.)",
+        "Test date": "Date of ETT",
+        "Reason for Stopping Test": "Angina (Ex or R) reason for stopping?",
+        "Reason for Test": "Angina (Ex or R) reason for stopping?",
+    }
+
     metadata = {}
-    for row_idx in range(min(15, len(df_raw))):
-        row = df_raw.iloc[row_idx]
-        for col_idx in range(len(row)):
-            cell_val = str(row[col_idx]).strip() if pd.notna(row[col_idx]) else ""
-            if cell_val in ["ID1", "Last Name", "First Name", "Gender", "Age", "Height (in)", "Weight (lbs)", "Test date", "Reason for Stopping Test", "Reason for Test"]:
-                # Look to the right for the first non-empty value
-                for next_col in range(col_idx + 1, len(row)):
-                    val = row[next_col]
-                    if pd.notna(val) and str(val).strip() != "":
-                        metadata[cell_val] = val
-                        break
+    for r in range(min(15, len(df_raw))):
+        for c in range(df_raw.shape[1]):
+            val = df_raw.iloc[r, c]
+            if pd.notna(val):
+                key = str(val).strip()
+                if key in key_mapping:
+                    target_col = key_mapping[key]
+                    if target_col in metadata:
+                        continue  # Avoid overwriting primary reason for stopping
+
+                    # Look right in the row for the associated value
+                    for nc in range(c + 1, df_raw.shape[1]):
+                        next_val = df_raw.iloc[r, nc]
+                        if pd.notna(next_val):
+                            next_str = str(next_val).strip()
+                            if next_str in key_mapping:
+                                break  # Stop if scanning into another metadata header label
+                            if next_str != "":
+                                metadata[target_col] = next_val
+                                break
     return metadata
 
 
 def process_cpet_file(file_path):
-    try:
-        xl = pd.ExcelFile(file_path)
-        sheet = "Data" if "Data" in xl.sheet_names else xl.sheet_names[0]
+    """Parses a single CPET BxB Excel file and isolates peak exercise metrics."""
+    xl = pd.ExcelFile(file_path)
+    sheet_name = "Data" if "Data" in xl.sheet_names else xl.sheet_names[0]
+    df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
 
-        # Parse metadata from header section
-        df_raw = pd.read_excel(file_path, sheet_name=sheet, header=None)
-        metadata = extract_header_metadata(df_raw)
+    # 1. Extract Metadata Demographics
+    meta = extract_header_metadata(df_raw)
 
-        # Parse breath-by-breath data table
-        df_data = pd.read_excel(file_path, sheet_name=sheet, header=0)
+    # Combine First/Last Name into "First Last" format
+    first_name = str(meta.pop("First Name", "")).strip()
+    last_name = str(meta.pop("Last Name", "")).strip()
+    full_name = f"{first_name} {last_name}".strip()
 
-        # Strip out unit row if present under header
-        if df_data.iloc[0].astype(str).str.contains("mL|L/min|s|%").any():
-            df_data = df_data.iloc[1:].reset_index(drop=True)
+    # Format Date
+    date_val = meta.get("Date of ETT")
+    formatted_date = (
+        pd.to_datetime(date_val).strftime("%Y-%m-%d")
+        if pd.notna(date_val)
+        else None
+    )
 
-        # Identify VO2 column for finding peak effort
-        vo2_col = None
-        for col in ["VO2/kg", "VO2", "VO2 ml/Kg/min"]:
-            if col in df_data.columns:
-                vo2_col = col
-                break
+    # 2. Extract Breath-by-Breath Table Data (Header at Row 0, Col 9+)
+    table_headers = list(df_raw.iloc[0, 9:].values)
+    df_table = df_raw.iloc[3:, 9:].copy()
+    df_table.columns = table_headers
 
-        if not vo2_col:
-            return None
+    # 3. Locate Peak VO2 Row Safely
+    vo2_col = "VO2/kg" if "VO2/kg" in df_table.columns else "VO2"
+    df_table[vo2_col] = pd.to_numeric(df_table[vo2_col], errors="coerce")
+    df_table = df_table.dropna(subset=[vo2_col]).reset_index(drop=True)
 
-        # Find row corresponding to Peak VO2
-        df_data[vo2_col] = pd.to_numeric(df_data[vo2_col], errors="coerce")
-        max_vo2_idx = df_data[vo2_col].idxmax()
-        max_row = df_data.loc[max_vo2_idx].to_dict()
+    max_idx = df_table[vo2_col].idxmax()
+    max_row = df_table.iloc[max_idx].to_dict()
 
-        # Combine header metadata and max VO2 metrics
-        combined_source = {**metadata, **max_row}
+    # 4. Map Extracted Data
+    extracted_data = {
+        "Name": full_name if full_name else None,
+        "Study ID #": meta.get("Study ID #"),
+        "Date of ETT": formatted_date,
+        "Gender": meta.get("Gender"),
+        "Age at ETT": meta.get("Age at ETT"),
+        "Height\n (in.)": meta.get("Height\n (in.)"),
+        "Weight \n(lbs.)": meta.get("Weight \n(lbs.)"),
+        "VO2 ml/Kg/min (max)": max_row.get("VO2/kg"),
+        "VO2 in ml (max)": max_row.get("VO2"),
+        "VCO2 (max)": max_row.get("VCO2"),
+        "VE (max)": max_row.get("VE"),
+        "RER max": max_row.get("RQ")
+        if pd.notna(max_row.get("RQ"))
+        else max_row.get("RER"),
+        "Measured METs (Max VO2)": max_row.get("METS"),
+        "VE/VC02 Slope": max_row.get("VE/VCO2"),
+        "Angina (Ex or R) reason for stopping?": meta.get(
+            "Angina (Ex or R) reason for stopping?"
+        ),
+    }
 
-        # Map to Master schema
-        extracted_data = {}
-        for master_col, source_aliases in COLUMN_MAPPING.items():
-            value = None
-            for alias in source_aliases:
-                if alias in combined_source and pd.notna(combined_source[alias]):
-                    value = combined_source[alias]
-                    break
-            extracted_data[master_col] = value
-
-        # Construct full name if First/Last Name are separately parsed
-        if not extracted_data.get("Name"):
-            last = combined_source.get("Last Name", "")
-            first = combined_source.get("First Name", "")
-            if last or first:
-                extracted_data["Name"] = f"{last}, {first}".strip(", ")
-
-        return extracted_data
-
-    except Exception as e:
-        print(f"Error processing {os.path.basename(file_path)}: {e}")
-        return None
-
-
-def main():
-    file_pattern = os.path.join(INPUT_FOLDER, "*.xlsx")
-    files = glob.glob(file_pattern)
-
-    if not files:
-        print(f"No Excel files found in folder '{INPUT_FOLDER}'.")
-        return
-
-    results = []
-    for file_path in files:
-        if os.path.basename(file_path) == os.path.basename(OUTPUT_FILE):
-            continue
-
-        data = process_cpet_file(file_path)
-        if data:
-            results.append(data)
-
-    if not results:
-        print("No valid data extracted.")
-        return
-
-    df_new = pd.DataFrame(results)
-
-    # Append records to the master file
-    if os.path.exists(OUTPUT_FILE):
-        with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
-            try:
-                df_existing = pd.read_excel(OUTPUT_FILE, sheet_name=OUTPUT_SHEET)
-                start_row = len(df_existing) + 1
-                df_new.to_excel(writer, sheet_name=OUTPUT_SHEET, index=False, header=False, startrow=start_row)
-            except ValueError:
-                df_new.to_excel(writer, sheet_name=OUTPUT_SHEET, index=False)
-    else:
-        df_new.to_excel(OUTPUT_FILE, sheet_name=OUTPUT_SHEET, index=False)
-
-    print(f"Successfully appended {len(results)} records to '{OUTPUT_FILE}'.")
+    return extracted_data
 
 
+def append_to_master_db(new_records):
+    """Appends structured records to the Master DB matching its schema perfectly."""
+    # Load original master sheet column layout
+    df_master = pd.read_excel(MASTER_DB_PATH, sheet_name=MASTER_SHEET_NAME)
+    master_columns = list(df_master.columns)
+
+    # Re-index new entries to align with all 87 columns in the exact master order
+    df_new = pd.DataFrame(new_records)
+    df_new = df_new.reindex(columns=master_columns)
+
+    # Append to master workbook using openpyxl overlay
+    with pd.ExcelWriter(
+        MASTER_DB_PATH, engine="openpyxl", mode="a", if_sheet_exists="overlay"
+    ) as writer:
+        start_row = len(df_master) + 1
+        df_new.to_excel(
+            writer,
+            sheet_name=MASTER_SHEET_NAME,
+            index=False,
+            header=False,
+            startrow=start_row,
+        )
+
+    print(
+        f"Successfully appended {len(new_records)} record(s) to '{MASTER_DB_PATH}'!"
+    )
+
+
+# Execution Pipeline
 if __name__ == "__main__":
-    main()
+    # Find all BxB Excel files matching pattern
+    bxb_files = glob.glob(
+        os.path.join(BXB_FILES_DIRECTORY, "*BxB*.xlsx")
+    ) + glob.glob(os.path.join(BXB_FILES_DIRECTORY, "*BxB*.xls"))
+
+    records_to_append = []
+    for file in bxb_files:
+        if file.startswith("~$"):  # Skip Excel temporary lock files
+            continue
+        try:
+            record = process_cpet_file(file)
+            records_to_append.append(record)
+            print(f"Processed: {file}")
+        except Exception as e:
+            print(f"Error processing {file}: {e}")
+
+    if records_to_append:
+        append_to_master_db(records_to_append)
+    else:
+        print("No new BxB files found to process.")
